@@ -17,7 +17,7 @@ During this transition, several intermediate parameter scales (including a 150 M
 | Objective | Canonical script(s) | Notes |
 |---|---|---|
 | 1 — Storage models | `01_Core_Models/*.m` | Battery, supercapacitor, flywheel models and degradation function |
-| 2 — PV baseline | `Objective_2_Grid_Baseline/Main_PV_Grid_Simulation.m` + `03_System_Simulation/Objective2_PVSimulation.slx` | Script-based and Simulink implementations |
+| 2 — PV baseline | `Objective_2_Grid_Baseline/Main_PV_Grid_Simulation.m` | Script-based implementation |
 | 3 — PV + BESS on IEEE 14-bus | `Objective_3_Grid_Bess/Test_Objective3_Foundation.m` (dispatch verification) and `Objective_3_Grid_Bess/IEEE14_PV_Injection.m` (OPF integration) | Uses `Parameters_BESS.m` at its original 15 MW / 10 MWh scale |
 | 4 — PV + HESS comparison | **`ProjectComaprisonResult/Project_Comparison_Final.m`** | The single source of truth for all Chapter 4 results (no-storage / BESS / HESS comparison, degradation, economics) |
 
@@ -40,8 +40,8 @@ This distinction, and the reasoning behind it, is documented in the written repo
 ```
 01_Core_Models/            Objective 1: storage technology models
 Objective_2_Grid_Baseline/ Objective 2: PV baseline (script-based)
-03_System_Simulation/      Objective 2: PV baseline (Simulink/Simscape)
 Objective_3_Grid_Bess/     Objective 3: PV + BESS, IEEE 14-bus OPF
 Objective_4_PV_HESS/       Objective 4: PV + HESS
 ProjectComaprisonResult/   Canonical Objective 3 vs 4 comparison — source of all Chapter 4 numbers
 ```
+
