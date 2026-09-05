@@ -1,266 +1,222 @@
-%% IEEE14_PV_Injection.m
+%% IEEE14_PV_Injection_OPF_Fixed.m
 % Objective 3: PV + BESS injected into IEEE 14 Bus Grid
-% Connects existing Solar_Profile, PV_Model, Battery_Model,
-% SOC_Model and Energy_Management to the IEEE 14 Bus network
-% Runs OPF for 24 hours and captures all generator activities
-%
-% Required files (already built):
-%   Solar_Profile.m
-%   PV_Model.m
-%   Load_Model.m
-%   Battery_Model.m
-%   SOC_Model.m
-%   Energy_Management.m
-%   Parameters_BESS.m
-%
-% Required toolbox:
-%   MATPOWER (already installed)
+% FIXES:
+%   1. PV scaled to 150 MW — large enough to trigger OPF generator redispatch
+%   2. Battery SOC min limit properly enforced via EMS
+%   3. Bus 2 generator reduction now visible when PV rises
 
 clc;
 clear;
+Parameters_BESS;
 
-%% ── STEP 1: Load Parameters ──────────────────────────────────────
-Parameters_BESS;   % Loads all your existing system parameters
+%% Override parameters — scaled for IEEE 14 Bus visibility
+PV_Rated_Power              = 150000000;  % 150 MW — large enough to affect grid
+Load_Rated_Power            = 5000000;    % 5 MW local load
+Battery_Capacity            = 50000000;   % 50 MWh
+Battery_Max_Charge_Power    = 20000000;   % 20 MW
+Battery_Max_Discharge_Power = 20000000;   % 20 MW
+Battery_SOC_Max             = 100;
+Battery_SOC_Min             = 20;         % 20% hard floor
+Battery_SOC_Initial         = 80;
+Battery_Charge_Efficiency   = 0.95;
+Battery_Discharge_Efficiency = 0.95;
 
-%% ── STEP 2: Load IEEE 14 Bus Network ────────────────────────────
-mpc = case14;      % Load standard IEEE 14 Bus test case
-
-% Base power for converting MW to per unit
-baseMVA = mpc.baseMVA;   % = 100 MVA
-
-fprintf('IEEE 14 Bus network loaded successfully\n');
-fprintf('Base MVA: %d\n', baseMVA);
-fprintf('Number of buses: %d\n', size(mpc.bus,1));
-fprintf('Number of generators: %d\n', size(mpc.gen,1));
-fprintf('Number of branches: %d\n\n', size(mpc.branch,1));
-
-%% ── STEP 3: Define PV Injection Bus ─────────────────────────────
-PV_Bus = 2;        % Bus 2 chosen for PV injection
-                   % Has 140 MW generator — PV will reduce its output
-
-fprintf('PV will be injected at Bus %d\n', PV_Bus);
-fprintf('Existing load at Bus %d: %.1f MW\n\n', ...
-    PV_Bus, mpc.bus(PV_Bus,3));
-
-%% ── STEP 4: Generate 24 Hour Time Vector ─────────────────────────
-time = 0:Time_Step:24;     % Uses Time_Step from Parameters_BESS
+%% Time vector and profiles
+time      = 0:Time_Step:24;
 num_steps = length(time);
 
-%% ── STEP 5: Generate PV and Load Profiles ────────────────────────
-Irradiance  = Solar_Profile(time);
-PV_Power_W  = PV_Model(Irradiance, PV_Rated_Power);
+Irradiance   = Solar_Profile(time);
+PV_Power_W   = PV_Model(Irradiance, PV_Rated_Power);
 Load_Power_W = Load_Model(time, Load_Rated_Power);
+PV_Power_MW  = PV_Power_W / 1e6;
 
-% Convert Watts to MW for MATPOWER
-PV_Power_MW   = PV_Power_W   / 1e6;
-Load_Power_MW = Load_Power_W / 1e6;
+fprintf('IEEE 14 Bus PV + BESS (Fixed)\n');
+fprintf('Peak PV Power:   %.1f MW\n',   max(PV_Power_MW));
+fprintf('Grid Total Load: 259 MW\n');
+fprintf('PV Penetration:  %.1f%%\n\n', (max(PV_Power_MW)/259)*100);
 
-fprintf('Peak PV Power: %.2f MW\n',   max(PV_Power_MW));
-fprintf('Peak Load Power: %.2f MW\n\n', max(Load_Power_MW));
+%% Load IEEE 14 Bus
+mpc     = case14;
+baseMVA = mpc.baseMVA;
+PV_Bus  = 2;
+gen_idx = find(mpc.gen(:,1) == PV_Bus);
 
-%% ── STEP 6: Run Battery Model ────────────────────────────────────
-Battery_Power_W = Battery_Model(...
-    PV_Power_W, ...
-    Load_Power_W, ...
-    Battery_Max_Charge_Power, ...
-    Battery_Max_Discharge_Power);
-
-SOC = SOC_Model(...
-    Battery_Power_W, ...
-    Battery_SOC_Initial, ...
-    Battery_Capacity, ...
-    Battery_Charge_Efficiency, ...
-    Time_Step);
-
-[Battery_Command_W, ~] = Energy_Management(...
-    PV_Power_W, ...
-    Load_Power_W, ...
-    SOC, ...
-    Battery_SOC_Max, ...
-    Battery_SOC_Min, ...
-    Battery_Max_Charge_Power, ...
-    Battery_Max_Discharge_Power);
-
-Battery_Command_MW = Battery_Command_W / 1e6;
-
-%% ── STEP 7: Run 24 Hour OPF on IEEE 14 Bus ───────────────────────
-% Pre-allocate storage for all generator outputs over 24 hours
-num_gen     = size(mpc.gen, 1);
-Gen_Output  = zeros(num_steps, num_gen);   % All generator MW outputs
-Bus2_Gen    = zeros(num_steps, 1);         % Bus 2 generator specifically
-PV_Injected = zeros(num_steps, 1);         % Actual PV injected each step
-Grid_Import = zeros(num_steps, 1);         % Grid import at Bus 2
-OPF_Success = zeros(num_steps, 1);         % Track convergence
-
-fprintf('Running 24-hour OPF simulation...\n');
-fprintf('This may take a few minutes.\n\n');
+%% Battery SOC tracking with proper min/max enforcement
+SOC_BESS      = zeros(num_steps, 1);
+SOC_BESS(1)   = Battery_SOC_Initial;
+Bat_Cmd_W     = zeros(num_steps, 1);
+Grid_BESS_W   = zeros(num_steps, 1);
 
 for k = 1:num_steps
+    Power_Error = PV_Power_W(k) - Load_Power_W(k);
 
-    % Copy base network for this time step
+    if Power_Error > 0
+        %% PV surplus — charge battery only if below max
+        if SOC_BESS(k) < Battery_SOC_Max
+            Bat_Cmd_W(k) = min(Power_Error, Battery_Max_Charge_Power);
+        else
+            Bat_Cmd_W(k) = 0;
+        end
+    elseif Power_Error < 0
+        %% PV deficit — discharge battery only if above min
+        if SOC_BESS(k) > Battery_SOC_Min
+            Bat_Cmd_W(k) = max(Power_Error, -Battery_Max_Discharge_Power);
+        else
+            %% Battery at minimum — grid must cover remainder
+            Bat_Cmd_W(k) = 0;
+        end
+    end
+
+    %% Grid covers what battery cannot
+    Grid_BESS_W(k) = Load_Power_W(k) - PV_Power_W(k) - Bat_Cmd_W(k);
+
+    %% Update SOC for next step
+    if k < num_steps
+        Energy_Change = Bat_Cmd_W(k) * Time_Step;
+        if Bat_Cmd_W(k) >= 0
+            Energy_Change = Energy_Change * Battery_Charge_Efficiency;
+        else
+            Energy_Change = Energy_Change / Battery_Discharge_Efficiency;
+        end
+        SOC_new = SOC_BESS(k) + (Energy_Change / Battery_Capacity) * 100;
+        %% Hard enforce SOC limits
+        SOC_new = max(min(SOC_new, Battery_SOC_Max), Battery_SOC_Min);
+        SOC_BESS(k+1) = SOC_new;
+    end
+end
+
+fprintf('SOC min reached: %.1f%%\n',   min(SOC_BESS));
+fprintf('SOC max reached: %.1f%%\n\n', max(SOC_BESS));
+
+%% Run 24 Hour OPF
+num_gen     = size(mpc.gen, 1);
+Gen_Output  = zeros(num_steps, num_gen);
+Bus2_Gen    = zeros(num_steps, 1);
+PV_Injected = zeros(num_steps, 1);
+OPF_Success = zeros(num_steps, 1);
+
+fprintf('Running 24-hour OPF...\n');
+
+for k = 1:num_steps
     mpc_k = mpc;
 
-    % Net PV contribution at Bus 2 (PV minus battery charging)
-    Net_PV_MW = PV_Power_MW(k) - Battery_Command_MW(k);
-    Net_PV_MW = max(Net_PV_MW, 0);   % Cannot be negative
+    %% Net PV after battery (convert to MW)
+    Net_PV_MW = (PV_Power_W(k) - max(Bat_Cmd_W(k), 0)) / 1e6;
+    Net_PV_MW = max(Net_PV_MW, 0);
 
-    % Inject PV at Bus 2 by reducing generator output requirement
-    % Find which generator is at Bus 2
-    gen_idx = find(mpc_k.gen(:,1) == PV_Bus);
-
-    % Reduce Bus 2 generator minimum output by PV amount
-    original_Pmin = mpc_k.gen(gen_idx, 10);
-    original_Pmax = mpc_k.gen(gen_idx, 9);
-
-    % PV reduces how much the generator needs to produce
-    new_Pmax = max(original_Pmax - Net_PV_MW, 0);
+    %% Reduce Bus 2 generator max by PV amount
+    orig_Pmax = mpc_k.gen(gen_idx, 9);
+    orig_Pmin = mpc_k.gen(gen_idx, 10);
+    new_Pmax  = max(orig_Pmax - Net_PV_MW, 0);
     mpc_k.gen(gen_idx, 9)  = new_Pmax;
-    mpc_k.gen(gen_idx, 10) = min(original_Pmin, new_Pmax);
+    mpc_k.gen(gen_idx, 10) = min(orig_Pmin, new_Pmax);
 
-    % Run Optimal Power Flow — as specified by lecturer (Pointer 3)
-    mpopt = mpoption('verbose', 0, 'out.all', 0);
+    mpopt     = mpoption('verbose', 0, 'out.all', 0);
     results_k = runopf(mpc_k, mpopt);
 
-    % Store results if converged
     if results_k.success
-        Gen_Output(k,:) = results_k.gen(:,2)';   % All generator MW
+        Gen_Output(k,:) = results_k.gen(:,2)';
         Bus2_Gen(k)     = results_k.gen(gen_idx, 2);
         PV_Injected(k)  = Net_PV_MW;
-        Grid_Import(k)  = max(-results_k.gen(1,2), 0);
         OPF_Success(k)  = 1;
     else
-        % If not converged keep previous step values
         if k > 1
             Gen_Output(k,:) = Gen_Output(k-1,:);
             Bus2_Gen(k)     = Bus2_Gen(k-1);
         end
-        fprintf('Warning: Step %d did not converge\n', k);
     end
 
-    % Progress update every 500 steps
     if mod(k, 500) == 0
-        fprintf('Progress: Hour %.1f / 24\n', time(k));
+        fprintf('  Hour %.1f / 24\n', time(k));
     end
-
 end
 
-fprintf('\nSimulation complete!\n');
-fprintf('Convergence rate: %.1f%%\n\n', ...
-    (sum(OPF_Success)/num_steps)*100);
+fprintf('\nConvergence: %.1f%%\n\n', (sum(OPF_Success)/num_steps)*100);
 
-%% ── STEP 8: Calculate Performance Metrics ────────────────────────
-% Energy calculations using trapezoidal integration
-PV_Energy_kWh      = trapz(time, PV_Power_W)   / 1000;
-Load_Energy_kWh    = trapz(time, Load_Power_W) / 1000;
-Battery_Charge_kWh = trapz(time, max(Battery_Command_W,0)) / 1000;
-Battery_Disch_kWh  = abs(trapz(time, min(Battery_Command_W,0))) / 1000;
+%% Performance metrics
+S2_PV_Energy     = trapz(time, PV_Power_W)             / 1000;
+S2_Load_Energy   = trapz(time, Load_Power_W)           / 1000;
+S2_Grid_Import   = trapz(time, max(Grid_BESS_W,0))     / 1000;
+S2_Grid_Export   = abs(trapz(time,min(Grid_BESS_W,0))) / 1000;
+S2_Renewable_Pct = (S2_PV_Energy/S2_Load_Energy)       * 100;
+S2_Grid_Dep      = (S2_Grid_Import/S2_Load_Energy)     * 100;
 
-% Generator reduction due to PV
-Gen2_Baseline_MWh = trapz(time, ones(size(time)) .* 40);
-Gen2_Actual_MWh   = trapz(time, Bus2_Gen);
-Gen2_Reduction    = Gen2_Baseline_MWh - Gen2_Actual_MWh;
+fprintf('PV Energy:           %.2f kWh\n', S2_PV_Energy);
+fprintf('Grid Import:         %.2f kWh\n', S2_Grid_Import);
+fprintf('Renewable %%:         %.1f%%\n',  S2_Renewable_Pct);
+fprintf('Grid Dependency:     %.1f%%\n\n', S2_Grid_Dep);
 
-% Renewable contribution
-Renewable_Pct = (PV_Energy_kWh / Load_Energy_kWh) * 100;
+%% ── PLOTS ────────────────────────────────────────────────────────
 
-%% ── STEP 9: Display Results ──────────────────────────────────────
-fprintf('========== IEEE 14 Bus PV + BESS Results ==========\n\n');
-fprintf('PV Energy Generated:        %.2f kWh\n',  PV_Energy_kWh);
-fprintf('Total Load Energy:          %.2f kWh\n',  Load_Energy_kWh);
-fprintf('Battery Charged:            %.2f kWh\n',  Battery_Charge_kWh);
-fprintf('Battery Discharged:         %.2f kWh\n',  Battery_Disch_kWh);
-fprintf('Renewable Contribution:     %.1f %%\n',   Renewable_Pct);
-fprintf('Bus 2 Generator Reduction:  %.2f MWh\n',  Gen2_Reduction);
-fprintf('\n');
-
-%% ── STEP 10: Plot All Results ────────────────────────────────────
-
-% Plot 1: Solar Irradiance
-figure('Name', 'Solar Irradiance Profile');
-plot(time, Irradiance, 'Color', [0.9 0.6 0.1], 'LineWidth', 2);
-xlabel('Time (Hours)');
-ylabel('Irradiance (W/m^2)');
+%% Plot 1 — Solar Irradiance
+figure('Name','Irradiance');
+plot(time, Irradiance, 'Color',[0.9 0.6 0.1], 'LineWidth',2);
+xlabel('Time (Hours)'); ylabel('Irradiance (W/m^2)');
 title('Solar Irradiance Profile — 24 Hours');
-grid on;
-xlim([0 24]);
-xticks(0:2:24);
+grid on; xlim([0 24]); xticks(0:2:24);
 
-% Plot 2: PV Power Output
-figure('Name', 'PV Power Output');
-plot(time, PV_Power_W/1000, 'Color', [0.2 0.7 0.3], 'LineWidth', 2);
-xlabel('Time (Hours)');
-ylabel('Power (kW)');
-title('PV Power Output — Bus 2');
-grid on;
-xlim([0 24]);
-xticks(0:2:24);
+%% Plot 2 — PV Power Output
+figure('Name','PV Power');
+plot(time, PV_Power_W/1e6, 'Color',[0.2 0.7 0.3], 'LineWidth',2);
+xlabel('Time (Hours)'); ylabel('Power (MW)');
+title('PV Power Output — Bus 2 (150 MW Rated)');
+grid on; xlim([0 24]); xticks(0:2:24);
 
-% Plot 3: All Generator Outputs over 24 Hours
-figure('Name', 'All Generator Outputs — IEEE 14 Bus');
-gen_colors = {'b','r','g','m','c'};
-gen_labels = {'Gen 1 (Bus 1)', 'Gen 2 (Bus 2)', ...
-              'Gen 3 (Bus 3)', 'Gen 4 (Bus 6)', ...
-              'Gen 5 (Bus 8)'};
+%% Plot 3 — All Generator Outputs
+figure('Name','All Generator Outputs — IEEE 14 Bus');
+gen_colors = {[0 0.4 0.8],[0.8 0.2 0.2],[0.2 0.7 0.3],[0.8 0.2 0.8],[0.1 0.8 0.8]};
+gen_labels = {'Gen 1 (Bus 1)','Gen 2 (Bus 2)','Gen 3 (Bus 3)',...
+              'Gen 4 (Bus 6)','Gen 5 (Bus 8)'};
 hold on;
 for g = 1:num_gen
-    plot(time, Gen_Output(:,g), ...
-        'Color', gen_colors{g}, ...
-        'LineWidth', 1.5, ...
-        'DisplayName', gen_labels{g});
+    plot(time, Gen_Output(:,g), 'Color',gen_colors{g}, ...
+        'LineWidth',1.5, 'DisplayName',gen_labels{g});
 end
 hold off;
-xlabel('Time (Hours)');
-ylabel('Generator Output (MW)');
-title('All Generator Outputs — 24 Hour Simulation');
-legend('Location', 'best');
-grid on;
-xlim([0 24]);
-xticks(0:2:24);
+xlabel('Time (Hours)'); ylabel('Generator Output (MW)');
+title('All Generator Outputs — IEEE 14 Bus with PV+BESS');
+legend('Location','best'); grid on;
+xlim([0 24]); xticks(0:2:24);
 
-% Plot 4: Bus 2 Generator vs PV Injection
-figure('Name', 'Bus 2 — Generator vs PV');
+%% Plot 4 — Bus 2 Generator vs PV Injection
+figure('Name','Bus 2 — Generator vs PV');
 hold on;
-plot(time, Bus2_Gen, 'b-', 'LineWidth', 2, ...
-    'DisplayName', 'Bus 2 Generator (MW)');
-plot(time, PV_Injected, 'g-', 'LineWidth', 2, ...
-    'DisplayName', 'PV Injected (MW)');
+plot(time, Bus2_Gen,    'b-', 'LineWidth',2, ...
+    'DisplayName','Bus 2 Generator (MW)');
+plot(time, PV_Injected, 'g-', 'LineWidth',2, ...
+    'DisplayName','Net PV Injected (MW)');
 hold off;
-xlabel('Time (Hours)');
-ylabel('Power (MW)');
+xlabel('Time (Hours)'); ylabel('Power (MW)');
 title('Bus 2 — Generator Output vs PV Injection');
-legend('Location', 'best');
-grid on;
-xlim([0 24]);
-xticks(0:2:24);
+legend('Location','best'); grid on;
+xlim([0 24]); xticks(0:2:24);
 
-% Plot 5: Battery SOC
-figure('Name', 'Battery State of Charge');
-plot(time, SOC, 'Color', [0.8 0.2 0.2], 'LineWidth', 2);
-xlabel('Time (Hours)');
-ylabel('SOC (%)');
+%% Plot 5 — Battery SOC with proper limits
+figure('Name','Battery SOC');
+plot(time, SOC_BESS, 'b-', 'LineWidth',2);
+xlabel('Time (Hours)'); ylabel('SOC (%)');
 title('Battery State of Charge — 24 Hours');
-ylim([0 100]);
-grid on;
-xlim([0 24]);
-xticks(0:2:24);
+yline(Battery_SOC_Max,'r--','Max','LineWidth',1.5);
+yline(Battery_SOC_Min,'r--','Min','LineWidth',1.5);
+ylim([0 110]); grid on;
+xlim([0 24]); xticks(0:2:24);
 
-% Plot 6: Power Balance Summary
-figure('Name', 'Power Balance');
+%% Plot 6 — Power Balance
+figure('Name','Power Balance — PV + BESS + Grid');
 hold on;
-plot(time, PV_Power_W/1000,       'g-',  'LineWidth', 2, ...
-    'DisplayName', 'PV Power (kW)');
-plot(time, Load_Power_W/1000,     'r-',  'LineWidth', 2, ...
-    'DisplayName', 'Load (kW)');
-plot(time, Battery_Command_W/1000,'b--', 'LineWidth', 1.5, ...
-    'DisplayName', 'Battery (kW)');
+plot(time, PV_Power_W/1e6,        'g-',  'LineWidth',2, ...
+    'DisplayName','PV (MW)');
+plot(time, Load_Power_W/1e6,      'r-',  'LineWidth',2, ...
+    'DisplayName','Load (MW)');
+plot(time, Bat_Cmd_W/1e6,         'b--', 'LineWidth',1.5, ...
+    'DisplayName','Battery (MW)');
+plot(time, Grid_BESS_W/1e6,       'k-',  'LineWidth',1.5, ...
+    'DisplayName','Grid (MW)');
 hold off;
-xlabel('Time (Hours)');
-ylabel('Power (kW)');
+xlabel('Time (Hours)'); ylabel('Power (MW)');
 title('Power Balance — PV + BESS + Grid');
-legend('Location', 'best');
-grid on;
-xlim([0 24]);
-xticks(0:2:24);
+legend('Location','best'); grid on;
+xlim([0 24]); xticks(0:2:24);
+yline(0,'k:','LineWidth',0.5);
 
-fprintf('All plots generated successfully!\n');
-fprintf('Objective 3 complete.\n');
+fprintf('All plots generated. Objective 3 Fixed complete!\n');
